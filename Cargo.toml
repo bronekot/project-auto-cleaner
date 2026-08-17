@@ -1,0 +1,6 @@
+[package]
+name = "project-auto-cleaner"
+version = "0.0.1"
+edition = "2021"
+description = "Safely clean stale Rust and JavaScript project artifacts"
+license = "MIT"
