@@ -3,7 +3,9 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
+
+mod size;
 
 pub type ProjectId = usize;
 
@@ -33,6 +35,19 @@ pub struct Project {
 }
 
 impl Project {
+    /// Keep nested projects distinguishable without repeating the scan root.
+    pub fn display_name(&self, root: &Path) -> String {
+        slash_relative_path(root, &self.root)
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| {
+                self.root
+                    .file_name()
+                    .unwrap_or(self.root.as_os_str())
+                    .to_string_lossy()
+                    .into_owned()
+            })
+    }
+
     fn has_kind(&self, kind: ProjectKind) -> bool {
         self.kinds.contains(&kind)
     }
@@ -175,6 +190,8 @@ impl TargetOutcome {
 pub struct TargetReport {
     pub target: CleanupTarget,
     pub outcome: TargetOutcome,
+    /// Estimated reclaimable bytes before removal; unknown for protected targets.
+    pub estimated_bytes: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -187,6 +204,10 @@ pub struct RunReport {
 impl RunReport {
     pub fn has_errors(&self) -> bool {
         !self.errors.is_empty()
+            || self
+                .projects
+                .iter()
+                .any(|project| matches!(project.status, ProjectStatus::Unverified { .. }))
             || self
                 .targets
                 .iter()
@@ -343,7 +364,7 @@ fn walk_activity(
                 continue;
             }
 
-            if is_ignored_directory(&path) {
+            if is_ignored_directory(&path) || dependency_kind(&path).is_some() {
                 continue;
             }
 
@@ -972,35 +993,44 @@ pub fn execute_plan(plan: &CleanupPlan, dry_run: bool) -> RunReport {
             target_reports.push(TargetReport {
                 target: target.clone(),
                 outcome: TargetOutcome::Protected(reason),
+                estimated_bytes: None,
             });
             continue;
         }
 
         let mut target = target.clone();
         match validate_target(&plan.canonical_root, &mut target) {
-            Ok(()) if dry_run => {
-                target_reports.push(TargetReport {
-                    target,
-                    outcome: TargetOutcome::WouldDelete,
-                });
-            }
-            Ok(()) => match fs::remove_dir_all(&target.path) {
-                Ok(()) => target_reports.push(TargetReport {
-                    target,
-                    outcome: TargetOutcome::Deleted,
-                }),
-                Err(error) => {
-                    let message = error.to_string();
-                    errors.push(RunError {
-                        path: Some(target.path.clone()),
-                        message: message.clone(),
-                    });
+            Ok(()) => {
+                let estimated_bytes = size::estimate_directory_size(&target.path).ok();
+                if dry_run {
                     target_reports.push(TargetReport {
                         target,
-                        outcome: TargetOutcome::Failed(message),
+                        outcome: TargetOutcome::WouldDelete,
+                        estimated_bytes,
                     });
+                    continue;
                 }
-            },
+
+                match fs::remove_dir_all(&target.path) {
+                    Ok(()) => target_reports.push(TargetReport {
+                        target,
+                        outcome: TargetOutcome::Deleted,
+                        estimated_bytes,
+                    }),
+                    Err(error) => {
+                        let message = error.to_string();
+                        errors.push(RunError {
+                            path: Some(target.path.clone()),
+                            message: message.clone(),
+                        });
+                        target_reports.push(TargetReport {
+                            target,
+                            outcome: TargetOutcome::Failed(message),
+                            estimated_bytes,
+                        });
+                    }
+                }
+            }
             Err(message) => {
                 errors.push(RunError {
                     path: Some(target.path.clone()),
@@ -1009,6 +1039,7 @@ pub fn execute_plan(plan: &CleanupPlan, dry_run: bool) -> RunReport {
                 target_reports.push(TargetReport {
                     target,
                     outcome: TargetOutcome::Failed(message),
+                    estimated_bytes: None,
                 });
             }
         }
@@ -1029,15 +1060,22 @@ fn target_protection_reason(target: &CleanupTarget, plan: &CleanupPlan) -> Optio
         return Some("target has no verified owners".into());
     }
     for owner in &target.owners {
+        let Some(project) = plan.projects.iter().find(|project| project.id == *owner) else {
+            return Some("an owning project could not be identified".into());
+        };
+        let name = project.display_name(&plan.canonical_root);
         match plan.statuses.get(owner) {
             Some(ProjectStatus::Stale { .. }) => {}
-            Some(ProjectStatus::Fresh { .. }) => {
-                return Some(format!("protected by fresh project #{owner}"));
+            Some(ProjectStatus::Fresh { latest_activity }) => {
+                return Some(format!(
+                    "{name} is active; last activity {}",
+                    format_relative_time(*latest_activity, plan.now)
+                ));
             }
             Some(ProjectStatus::Unverified { .. }) => {
-                return Some(format!("protected by unverified project #{owner}"));
+                return Some(format!("could not verify activity for {name}"));
             }
-            None => return Some(format!("owner project #{owner} was not found")),
+            None => return Some(format!("activity for {name} is unavailable")),
         }
     }
     None
@@ -1126,6 +1164,7 @@ fn is_ignored_directory(path: &Path) -> bool {
                 | ".cache"
                 | ".next"
                 | ".nuxt"
+                | ".output"
                 | ".turbo"
                 | ".parcel-cache"
         )
@@ -1175,9 +1214,44 @@ fn is_windows_reparse_point(_metadata: &fs::Metadata) -> bool {
 }
 
 pub fn format_system_time(time: SystemTime) -> String {
-    match time.duration_since(UNIX_EPOCH) {
-        Ok(duration) => format!("{}s since UNIX_EPOCH", duration.as_secs()),
-        Err(error) => format!("{}s before UNIX_EPOCH", error.duration().as_secs()),
+    format_relative_time(time, SystemTime::now())
+}
+
+pub fn format_relative_time(time: SystemTime, now: SystemTime) -> String {
+    match now.duration_since(time) {
+        Ok(duration) if duration.as_secs() == 0 => "just now".into(),
+        Ok(duration) => format!("{} ago", format_duration(duration)),
+        Err(error) => format!(
+            "in {} (future timestamp)",
+            format_duration(error.duration())
+        ),
+    }
+}
+
+/// Show at most two units, without approximating calendar months or years.
+pub fn format_duration(duration: Duration) -> String {
+    let mut remaining = duration.as_secs();
+    let mut parts = Vec::new();
+    for (seconds, unit) in [
+        (SECONDS_PER_DAY, "day"),
+        (3_600, "hour"),
+        (60, "minute"),
+        (1, "second"),
+    ] {
+        let count = remaining / seconds;
+        remaining %= seconds;
+        if count > 0 {
+            let suffix = if count == 1 { "" } else { "s" };
+            parts.push(format!("{count} {unit}{suffix}"));
+        }
+        if parts.len() == 2 {
+            break;
+        }
+    }
+    if parts.is_empty() {
+        "less than a second".into()
+    } else {
+        parts.join(" ")
     }
 }
 
@@ -1291,9 +1365,17 @@ pub fn threshold_for_days(days: u64) -> Result<Duration, CliError> {
 }
 
 pub fn usage() -> &'static str {
-    "Usage: project-auto-cleaner <ROOT> [--days N] [--dry-run] [--verbose]\n\n\
-Default: clean projects whose latest relevant file is older than 90 days.\n\
-Use --dry-run to inspect the plan without deleting anything."
+    "Usage: project-auto-cleaner <ROOT> [--days N] [--dry-run] [--verbose]
+
+Remove dependency and build directories from inactive Rust and JavaScript projects.
+Source files are preserved. Cleanup runs by default.
+
+Options:
+  --days N     Clean after more than N days without activity (default: 90).
+  --dry-run    Preview cleanup without deleting anything.
+  --verbose    Include projects with no cleanup directories and shared owners.
+  -h, --help   Show this help.
+  --version    Show the version."
 }
 
 #[cfg(test)]
@@ -1301,6 +1383,7 @@ mod tests {
     use super::*;
     use std::fs::{self, File};
     use std::io::Write;
+    use std::time::UNIX_EPOCH;
 
     struct TestDir {
         path: PathBuf,
@@ -1502,5 +1585,164 @@ mod tests {
             ownership_error: None,
         };
         assert!(validate_target(&root, &mut target).is_err());
+    }
+
+    #[test]
+    fn relative_time_handles_boundaries_and_future_timestamps() {
+        let now = UNIX_EPOCH + Duration::from_secs(10 * SECONDS_PER_DAY);
+        for (seconds, expected) in [
+            (0, "just now"),
+            (1, "1 second ago"),
+            (59, "59 seconds ago"),
+            (60, "1 minute ago"),
+            (3_599, "59 minutes 59 seconds ago"),
+            (3_600, "1 hour ago"),
+            (86_400, "1 day ago"),
+            (183_660, "2 days 3 hours ago"),
+        ] {
+            assert_eq!(
+                format_relative_time(now - Duration::from_secs(seconds), now),
+                expected
+            );
+        }
+        assert_eq!(
+            format_relative_time(now + Duration::from_secs(3_600), now),
+            "in 1 hour (future timestamp)"
+        );
+        assert_eq!(
+            format_relative_time(UNIX_EPOCH - Duration::from_secs(60), UNIX_EPOCH),
+            "1 minute ago"
+        );
+    }
+
+    #[test]
+    fn generated_output_is_not_discovered_or_cleaned_as_a_project() {
+        let temp = TestDir::new();
+        let root = temp.path.as_path();
+        write_file(&root.join("package.json"), "{}");
+        let old = SystemTime::now() - Duration::from_secs(10 * SECONDS_PER_DAY);
+        set_modified(&root.join("package.json"), old);
+        write_file(&root.join(".output/server/package.json"), "{}");
+        write_file(
+            &root.join(".output/server/node_modules/runtime.js"),
+            "runtime",
+        );
+        write_file(&root.join("node_modules/dependency.js"), "dependency");
+
+        let plan =
+            build_cleanup_plan(root, SystemTime::now(), threshold_for_days(2).unwrap()).unwrap();
+        assert_eq!(plan.projects.len(), 1);
+        assert!(plan.statuses[&plan.projects[0].id].is_stale());
+        assert_eq!(plan.targets.len(), 1);
+        assert_eq!(plan.targets[0].path, root.join("node_modules"));
+        let report = execute_plan(&plan, false);
+        assert!(!report.has_errors());
+        assert!(!root.join("node_modules").exists());
+        assert!(root.join(".output/server/node_modules/runtime.js").exists());
+    }
+
+    #[test]
+    fn yarn_dependencies_do_not_count_as_project_activity() {
+        let temp = TestDir::new();
+        let root = temp.path.as_path();
+        write_file(&root.join("package.json"), "{}");
+        set_modified(
+            &root.join("package.json"),
+            SystemTime::now() - Duration::from_secs(10 * SECONDS_PER_DAY),
+        );
+        write_file(&root.join(".yarn/cache/package.zip"), "cached");
+        write_file(&root.join(".yarn/unplugged/package/index.js"), "unplugged");
+
+        let plan =
+            build_cleanup_plan(root, SystemTime::now(), threshold_for_days(2).unwrap()).unwrap();
+        assert!(plan.statuses[&plan.projects[0].id].is_stale());
+        assert_eq!(plan.targets.len(), 2);
+        let report = execute_plan(&plan, true);
+        assert!(report.targets.iter().all(|target| {
+            matches!(target.outcome, TargetOutcome::WouldDelete) && target.estimated_bytes.is_some()
+        }));
+        assert!(root.join(".yarn/cache/package.zip").exists());
+    }
+
+    #[test]
+    fn fresh_workspace_member_protects_shared_target_with_a_readable_reason() {
+        let temp = TestDir::new();
+        let root = temp.path.as_path();
+        write_file(
+            &root.join("Cargo.toml"),
+            "[workspace]\nmembers=['crates/*']\n",
+        );
+        set_modified(
+            &root.join("Cargo.toml"),
+            SystemTime::now() - Duration::from_secs(10 * SECONDS_PER_DAY),
+        );
+        write_file(
+            &root.join("crates/api/Cargo.toml"),
+            "[package]\nname='api'\n",
+        );
+        write_file(&root.join("target/artifact"), "compiled");
+
+        let plan =
+            build_cleanup_plan(root, SystemTime::now(), threshold_for_days(2).unwrap()).unwrap();
+        let report = execute_plan(&plan, false);
+        let TargetOutcome::Protected(reason) = &report.targets[0].outcome else {
+            panic!("a fresh member must protect its shared target");
+        };
+        assert!(reason.contains("crates/api is active; last activity"));
+        assert!(!reason.contains("project #"));
+        assert!(root.join("target/artifact").exists());
+        assert!(report.targets[0].estimated_bytes.is_none());
+    }
+
+    #[test]
+    fn unverified_project_is_an_error_even_without_cleanup_targets() {
+        let temp = TestDir::new();
+        write_file(&temp.path.join("package.json"), "{}");
+        let mut plan = build_cleanup_plan(
+            &temp.path,
+            SystemTime::now(),
+            threshold_for_days(2).unwrap(),
+        )
+        .unwrap();
+        let project = &plan.projects[0];
+        plan.statuses.insert(
+            project.id,
+            ProjectStatus::Unverified {
+                errors: vec![ActivityError {
+                    path: project.root.clone(),
+                    message: "cannot read source files".into(),
+                }],
+            },
+        );
+        let report = execute_plan(&plan, true);
+        assert!(report.targets.is_empty());
+        assert!(report.has_errors());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn size_estimate_uses_allocated_blocks_without_following_symlinks_or_external_hard_links() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+        let temp = TestDir::new();
+        let target = temp.path.join("target");
+        fs::create_dir(&target).unwrap();
+        write_file(&target.join("artifact"), &"x".repeat(8_192));
+        fs::hard_link(target.join("artifact"), target.join("artifact-link")).unwrap();
+        write_file(&temp.path.join("outside"), &"x".repeat(16_384));
+        fs::hard_link(temp.path.join("outside"), target.join("shared")).unwrap();
+        symlink(temp.path.join("outside"), target.join("symlink")).unwrap();
+        let sparse = File::create(target.join("sparse")).unwrap();
+        sparse.set_len(1_000_000_000).unwrap();
+
+        let expected = [
+            &target,
+            &target.join("artifact"),
+            &target.join("symlink"),
+            &target.join("sparse"),
+        ]
+        .iter()
+        .map(|path| fs::symlink_metadata(path).unwrap().blocks() * 512)
+        .sum::<u64>();
+        assert_eq!(size::estimate_directory_size(&target).unwrap(), expected);
     }
 }
