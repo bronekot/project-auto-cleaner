@@ -4,3 +4,11 @@ version = "0.0.1"
 edition = "2021"
 description = "Safely clean stale Rust and JavaScript project artifacts"
 license = "MIT"
+rust-version = "1.82"
+
+[dependencies]
+glob = "0.3"
+toml = "0.9"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
