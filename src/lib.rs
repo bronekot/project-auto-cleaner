@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fmt::{Display, Formatter};
 use std::fs;
@@ -6,6 +6,8 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
+
+mod size;
 
 pub type ProjectId = usize;
 
@@ -62,6 +64,18 @@ pub struct Project {
 }
 
 impl Project {
+    /// Keep nested projects distinguishable without repeating the scan root.
+    pub fn display_name(&self, root: &Path) -> String {
+        slash_relative_path(root, &self.root)
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| {
+                self.root.file_name().map_or_else(
+                    || strip_verbatim(&self.root).display().to_string(),
+                    |name| name.to_string_lossy().into_owned(),
+                )
+            })
+    }
+
     pub fn has_kind(&self, kind: ProjectKind) -> bool {
         self.markers.contains_key(&kind)
     }
@@ -212,8 +226,8 @@ impl TargetOutcome {
 pub struct TargetReport {
     pub target: CleanupTarget,
     pub outcome: TargetOutcome,
-    /// Size of a deleted (or, in a dry run, deletable) directory.
-    pub bytes: u64,
+    /// Estimated reclaimable bytes before removal; unknown for kept targets.
+    pub estimated_bytes: Option<u64>,
 }
 
 impl TargetReport {
@@ -221,7 +235,7 @@ impl TargetReport {
         Self {
             target,
             outcome,
-            bytes: 0,
+            estimated_bytes: None,
         }
     }
 }
@@ -1047,8 +1061,9 @@ fn execute_target(plan: &CleanupPlan, original: &CleanupTarget, dry_run: bool) -
                 TargetOutcome::Failed("target changed since planning".into()),
             );
         }
-        target = current.clone();
-        if let Some(outcome) = ownership_protection(&current_plan, &target, &plan.canonical_root) {
+        // Report the original target: its owner ids refer to `plan`, while
+        // ids in the refreshed plan are local to it.
+        if let Some(outcome) = ownership_protection(&current_plan, current, &plan.canonical_root) {
             return TargetReport::new(target, outcome);
         }
     }
@@ -1060,19 +1075,19 @@ fn execute_target(plan: &CleanupPlan, original: &CleanupTarget, dry_run: bool) -
         return TargetReport::new(target, TargetOutcome::Failed(message));
     }
 
-    let bytes = disk_usage(&target.path);
+    let estimated_bytes = size::estimate_directory_size(&target.path).ok();
     if dry_run {
         return TargetReport {
             target,
             outcome: TargetOutcome::WouldDelete,
-            bytes,
+            estimated_bytes,
         };
     }
     match remove_target(&target.path) {
         Ok(()) => TargetReport {
             target,
             outcome: TargetOutcome::Deleted,
-            bytes,
+            estimated_bytes,
         },
         Err(message) => TargetReport::new(target, TargetOutcome::Failed(message)),
     }
@@ -1157,17 +1172,20 @@ fn owner_protection_reason(
         return Some("target has no verified owners".into());
     }
     target.owners.iter().find_map(|id| {
-        let shown = plan.projects.get(*id).map_or_else(
-            || format!("#{id}"),
-            |project| display_path(display_root, &project.root),
-        );
+        let Some(project) = plan.projects.get(*id) else {
+            return Some("an owning project could not be identified".into());
+        };
+        let name = project.display_name(display_root);
         match plan.statuses.get(id) {
             Some(ProjectStatus::Stale { .. }) => None,
-            Some(ProjectStatus::Fresh { .. }) => Some(format!("project {shown} is active")),
+            Some(ProjectStatus::Fresh { latest_activity }) => Some(format!(
+                "{name} is active; last activity {}",
+                format_relative_time(*latest_activity, plan.options.now)
+            )),
             Some(ProjectStatus::Unverified { .. }) => {
-                Some(format!("project {shown} could not be verified"))
+                Some(format!("could not verify activity for {name}"))
             }
-            None => Some(format!("owner project {shown} was not found")),
+            None => Some(format!("activity for {name} is unavailable")),
         }
     })
 }
@@ -1329,145 +1347,6 @@ fn tracked_target_reason(path: &Path) -> Result<Option<String>, String> {
     Ok((!output.stdout.is_empty()).then(|| "contains Git-tracked files".into()))
 }
 
-/// Disk space freed by deleting `path`: allocated sizes, without following
-/// links. A hard-linked file counts once, and only when all of its links are
-/// inside `path`; otherwise deleting it frees nothing.
-fn disk_usage(path: &Path) -> u64 {
-    let mut usage = DiskUsage::default();
-    usage.add_directory(path);
-    usage.unique
-        + usage
-            .linked
-            .values()
-            .filter(|linked| linked.seen >= linked.links)
-            .map(|linked| linked.size)
-            .sum::<u64>()
-}
-
-#[derive(Default)]
-struct DiskUsage {
-    unique: u64,
-    linked: HashMap<FileId, LinkedFile>,
-}
-
-struct LinkedFile {
-    size: u64,
-    links: u64,
-    seen: u64,
-}
-
-/// Volume and file number.
-type FileId = (u64, u64);
-
-struct FileUsage {
-    size: u64,
-    /// Identity and link count of a file with more than one hard link.
-    hard_link: Option<(FileId, u64)>,
-}
-
-impl DiskUsage {
-    fn add_directory(&mut self, path: &Path) {
-        let Ok(entries) = fs::read_dir(path) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let Ok(metadata) = entry.metadata() else {
-                continue;
-            };
-            if metadata.is_dir() {
-                self.add_directory(&entry.path());
-            } else if metadata.is_file() {
-                let usage = file_usage(&entry.path(), &metadata);
-                match usage.hard_link {
-                    None => self.unique += usage.size,
-                    Some((id, links)) => {
-                        self.linked
-                            .entry(id)
-                            .or_insert(LinkedFile {
-                                size: usage.size,
-                                links,
-                                seen: 0,
-                            })
-                            .seen += 1;
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[cfg(unix)]
-fn file_usage(_path: &Path, metadata: &fs::Metadata) -> FileUsage {
-    use std::os::unix::fs::MetadataExt;
-    FileUsage {
-        size: metadata.blocks() * 512,
-        hard_link: (metadata.nlink() > 1)
-            .then(|| ((metadata.dev(), metadata.ino()), metadata.nlink())),
-    }
-}
-
-#[cfg(windows)]
-fn file_usage(path: &Path, metadata: &fs::Metadata) -> FileUsage {
-    windows_file_usage(path).unwrap_or(FileUsage {
-        size: metadata.len(),
-        hard_link: None,
-    })
-}
-
-#[cfg(windows)]
-fn windows_file_usage(path: &Path) -> Option<FileUsage> {
-    use std::mem::{size_of, MaybeUninit};
-    use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FileStandardInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
-        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_STANDARD_INFO,
-    };
-
-    // Metadata-only access: file contents are never read.
-    let file = fs::OpenOptions::new()
-        .access_mode(0)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-        .ok()?;
-    let handle = file.as_raw_handle();
-    let mut identity = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
-    let mut standard = MaybeUninit::<FILE_STANDARD_INFO>::uninit();
-    // SAFETY: `handle` stays open for both calls, and each buffer has the size
-    // and layout its call expects; they are read only after the calls succeed.
-    let (identity, standard) = unsafe {
-        if GetFileInformationByHandle(handle, identity.as_mut_ptr()) == 0
-            || GetFileInformationByHandleEx(
-                handle,
-                FileStandardInfo,
-                standard.as_mut_ptr().cast(),
-                size_of::<FILE_STANDARD_INFO>() as u32,
-            ) == 0
-        {
-            return None;
-        }
-        (identity.assume_init(), standard.assume_init())
-    };
-    let links = u64::from(identity.nNumberOfLinks);
-    let id = (
-        u64::from(identity.dwVolumeSerialNumber),
-        (u64::from(identity.nFileIndexHigh) << 32) | u64::from(identity.nFileIndexLow),
-    );
-    Some(FileUsage {
-        size: u64::try_from(standard.AllocationSize).unwrap_or(0),
-        hard_link: (links > 1).then_some((id, links)),
-    })
-}
-
-#[cfg(not(any(unix, windows)))]
-fn file_usage(_path: &Path, metadata: &fs::Metadata) -> FileUsage {
-    FileUsage {
-        size: metadata.len(),
-        hard_link: None,
-    }
-}
-
 fn dependency_kind(path: &Path) -> Option<CleanupKind> {
     let name = path.file_name()?.to_str()?;
     if name_matches(name, "node_modules") {
@@ -1576,38 +1455,41 @@ pub fn strip_verbatim(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-/// Shows `path` relative to `root`, or as a plain absolute path outside it.
-pub fn display_path(root: &Path, path: &Path) -> String {
-    match path.strip_prefix(root) {
-        Ok(relative) if relative.as_os_str().is_empty() => ".".into(),
-        Ok(relative) => relative.display().to_string(),
-        Err(_) => strip_verbatim(path).display().to_string(),
-    }
-}
-
-pub fn format_age(time: SystemTime, now: SystemTime) -> String {
+pub fn format_relative_time(time: SystemTime, now: SystemTime) -> String {
     match now.duration_since(time) {
-        Ok(age) => match age.as_secs() / SECONDS_PER_DAY {
-            0 => "today".into(),
-            1 => "1 day ago".into(),
-            days => format!("{days} days ago"),
-        },
-        Err(_) => "in the future".into(),
+        Ok(duration) if duration.as_secs() == 0 => "just now".into(),
+        Ok(duration) => format!("{} ago", format_duration(duration)),
+        Err(error) => format!(
+            "in {} (future timestamp)",
+            format_duration(error.duration())
+        ),
     }
 }
 
-pub fn format_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
+/// Show at most two units, without approximating calendar months or years.
+pub fn format_duration(duration: Duration) -> String {
+    let mut remaining = duration.as_secs();
+    let mut parts = Vec::new();
+    for (seconds, unit) in [
+        (SECONDS_PER_DAY, "day"),
+        (3_600, "hour"),
+        (60, "minute"),
+        (1, "second"),
+    ] {
+        let count = remaining / seconds;
+        remaining %= seconds;
+        if count > 0 {
+            let suffix = if count == 1 { "" } else { "s" };
+            parts.push(format!("{count} {unit}{suffix}"));
+        }
+        if parts.len() == 2 {
+            break;
+        }
     }
-    if unit == 0 {
-        format!("{bytes} B")
+    if parts.is_empty() {
+        "less than a second".into()
     } else {
-        format!("{value:.1} {}", UNITS[unit])
+        parts.join(" ")
     }
 }
 
@@ -2024,24 +1906,47 @@ mod tests {
             "[target        ]"
         );
         assert_eq!(format!("[{:6}]", ProjectKind::Cargo), "[cargo ]");
-        assert_eq!(format_bytes(0), "0 B");
-        assert_eq!(format_bytes(1536), "1.5 KiB");
-        assert_eq!(format_bytes(3 * 1024 * 1024 * 1024), "3.0 GiB");
-        let now = SystemTime::now();
-        assert_eq!(format_age(now, now), "today");
-        assert_eq!(
-            format_age(now - Duration::from_secs(5 * SECONDS_PER_DAY + 10), now),
-            "5 days ago"
-        );
-        assert_eq!(
-            format_age(now + Duration::from_secs(60), now),
-            "in the future"
-        );
         let root = Path::new("projects");
-        assert_eq!(display_path(root, root), ".");
+        let project = |path: PathBuf| Project {
+            id: 0,
+            root: path,
+            markers: BTreeMap::new(),
+        };
+        assert_eq!(project(root.to_path_buf()).display_name(root), "projects");
         assert_eq!(
-            display_path(root, &root.join("a").join("target")),
-            Path::new("a").join("target").display().to_string()
+            project(root.join("one").join("frontend")).display_name(root),
+            "one/frontend"
+        );
+    }
+
+    #[test]
+    fn relative_time_handles_boundaries_and_future_timestamps() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10 * SECONDS_PER_DAY);
+        for (seconds, expected) in [
+            (0, "just now"),
+            (1, "1 second ago"),
+            (59, "59 seconds ago"),
+            (60, "1 minute ago"),
+            (3_599, "59 minutes 59 seconds ago"),
+            (3_600, "1 hour ago"),
+            (86_400, "1 day ago"),
+            (183_660, "2 days 3 hours ago"),
+        ] {
+            assert_eq!(
+                format_relative_time(now - Duration::from_secs(seconds), now),
+                expected
+            );
+        }
+        assert_eq!(
+            format_relative_time(now + Duration::from_secs(3_600), now),
+            "in 1 hour (future timestamp)"
+        );
+        assert_eq!(
+            format_relative_time(
+                SystemTime::UNIX_EPOCH - Duration::from_secs(60),
+                SystemTime::UNIX_EPOCH
+            ),
+            "1 minute ago"
         );
     }
 
@@ -2152,7 +2057,9 @@ mod tests {
 
         assert!(!report.has_errors(), "{report:#?}");
         assert!(matches!(report.targets[0].outcome, TargetOutcome::Deleted));
-        assert!(report.targets[0].bytes > 0);
+        assert!(report.targets[0]
+            .estimated_bytes
+            .is_some_and(|bytes| bytes > 0));
         assert!(!temp.path.join("target").exists());
         assert!(temp.path.join("Cargo.toml").exists());
     }
@@ -2178,7 +2085,9 @@ mod tests {
             report.targets[0].outcome,
             TargetOutcome::WouldDelete
         ));
-        assert!(report.targets[0].bytes > 0);
+        assert!(report.targets[0]
+            .estimated_bytes
+            .is_some_and(|bytes| bytes > 0));
         assert!(temp.path.join("target/debug/artifact").exists());
     }
 
@@ -2447,7 +2356,7 @@ mod tests {
         let roots = plan
             .projects
             .iter()
-            .map(|project| display_path(&plan.canonical_root, &project.root))
+            .map(|project| project.display_name(&plan.canonical_root))
             .collect::<Vec<_>>();
         assert_eq!(roots, ["Recovery"]);
 
@@ -2465,16 +2374,65 @@ mod tests {
         let outside = TestDir::new();
         let directory = temp.path.join("target");
         write_file(&directory.join("a.bin"), &"x".repeat(64 * 1024));
-        let single = disk_usage(&directory);
+        let single = size::estimate_directory_size(&directory).unwrap();
         assert!(single >= 64 * 1024, "{single}");
 
         fs::hard_link(directory.join("a.bin"), directory.join("b.bin")).unwrap();
-        assert_eq!(disk_usage(&directory), single);
+        assert_eq!(size::estimate_directory_size(&directory).unwrap(), single);
 
         // Deleting a file that is also linked elsewhere frees nothing.
         write_file(&directory.join("c.bin"), &"y".repeat(64 * 1024));
         fs::hard_link(directory.join("c.bin"), outside.path.join("c.bin")).unwrap();
-        assert_eq!(disk_usage(&directory), single);
+        assert_eq!(size::estimate_directory_size(&directory).unwrap(), single);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn size_estimate_uses_allocated_blocks_without_following_symlinks_or_external_hard_links() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+        let temp = TestDir::new();
+        let target = temp.path.join("target");
+        fs::create_dir(&target).unwrap();
+        write_file(&target.join("artifact"), &"x".repeat(8_192));
+        fs::hard_link(target.join("artifact"), target.join("artifact-link")).unwrap();
+        write_file(&temp.path.join("outside"), &"x".repeat(16_384));
+        fs::hard_link(temp.path.join("outside"), target.join("shared")).unwrap();
+        symlink(temp.path.join("outside"), target.join("symlink")).unwrap();
+        let sparse = File::create(target.join("sparse")).unwrap();
+        sparse.set_len(1_000_000_000).unwrap();
+
+        let expected = [
+            &target,
+            &target.join("artifact"),
+            &target.join("symlink"),
+            &target.join("sparse"),
+        ]
+        .iter()
+        .map(|path| fs::symlink_metadata(path).unwrap().blocks() * 512)
+        .sum::<u64>();
+        assert_eq!(size::estimate_directory_size(&target).unwrap(), expected);
+    }
+
+    #[test]
+    fn fresh_workspace_member_protects_shared_target_with_a_readable_reason() {
+        let temp = TestDir::new();
+        old_cargo(&temp.path, "[workspace]\nmembers=['crates/*']\n");
+        write_file(
+            &temp.path.join("crates/api/Cargo.toml"),
+            "[package]\nname='api'\n",
+        );
+        cargo_target(&temp.path);
+        let report = execute_plan(&plan_for(&temp.path), false);
+        let TargetOutcome::Protected(reason) = &report.targets[0].outcome else {
+            panic!("a fresh member must protect its shared target");
+        };
+        assert!(
+            reason.contains("crates/api is active; last activity"),
+            "{reason}"
+        );
+        assert!(!reason.contains("project #"));
+        assert!(temp.path.join("target/debug/artifact").exists());
+        assert!(report.targets[0].estimated_bytes.is_none());
     }
 
     #[test]
@@ -2521,6 +2479,25 @@ mod tests {
             let deleted = matches!(report.targets[0].outcome, TargetOutcome::Deleted);
             assert_eq!(deleted, !is_tauri, "{report:#?}");
         }
+    }
+
+    #[test]
+    fn deleted_target_keeps_owner_ids_of_the_plan() {
+        let temp = TestDir::new();
+        write_file(&temp.path.join("a-active/package.json"), "{}");
+        old_cargo(&temp.path.join("b-old"), "[package]\nname='old'");
+        cargo_target(&temp.path.join("b-old"));
+        let plan = plan_for(&temp.path);
+        let owner = plan
+            .projects
+            .iter()
+            .find(|project| project.root.ends_with("b-old"))
+            .unwrap()
+            .id;
+        assert_ne!(owner, 0);
+        let report = execute_plan(&plan, false);
+        assert!(matches!(report.targets[0].outcome, TargetOutcome::Deleted));
+        assert_eq!(report.targets[0].target.owners, [owner]);
     }
 
     #[test]
